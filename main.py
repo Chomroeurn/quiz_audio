@@ -1,44 +1,45 @@
 """
-Khmer TTS Telegram Bot - Enhanced with Male Voice
-=================================================
+Khmer TTS Telegram Bot - Enhanced with Voice Manipulation for Male Sound
+========================================================================
 
-This single-file Python bot listens for text messages and replies with a Khmer TTS audio file.
+This bot converts Khmer text to speech and applies audio processing to make the female voice
+sound more masculine through pitch shifting and formant manipulation.
 
 Features:
-- Uses `gTTS` for Khmer Text-to-Speech with slower, softer speech
-- Male voice preference when available
-- Uses `python-telegram-bot` for Telegram integration (v13 style Updater based example)
-- Handles `/start` and `/help` commands
-- `/speak <text>` command explicitly creates audio from provided text
-- Any plain text message (non-command) will also be converted to speech
-- Splits long text into chunks to avoid remote TTS length limits
-- Includes health check endpoint for deployment platforms
-- Enhanced audio processing for softer, more natural sound
+- Uses `gTTS` for Khmer Text-to-Speech (female voice base)
+- Applies pitch shifting and audio processing to simulate male voice
+- Advanced audio manipulation using `pydub` and `librosa`
+- Telegram integration with enhanced user experience
+- Automatic text chunking for long messages
+- Health check endpoint for deployment
 
 Requirements
 ------------
 Install required packages:
 
-    pip install python-telegram-bot==13.17 gTTS pydub
+    pip install python-telegram-bot==13.17 gTTS pydub librosa soundfile numpy
+
+For full audio processing capabilities, also install:
+- FFmpeg (system package)
+- SoX (optional, for advanced audio effects)
 
 Environment
 -----------
-Set your Telegram Bot Token in an environment variable named `TELEGRAM_TOKEN`.
-
-Example (Linux/macOS):
+Set your Telegram Bot Token:
 
     export TELEGRAM_TOKEN="123456:ABC-DEF..."
 
-Run
----
+Usage
+-----
 
     python khmer_tts_telegram_bot.py
 
-Notes
------
-- gTTS sends requests to Google to get speech; it requires network access
-- Audio is processed to be slower and softer for better listening experience
-- pydub is used for audio enhancement (requires ffmpeg for full functionality)
+Audio Processing Notes
+---------------------
+- Base female voice is pitch-shifted down to simulate male voice
+- Formant frequencies are adjusted for masculine characteristics  
+- Speed and tone are modified for more natural male sound
+- Processing may take longer but results in more convincing male voice
 
 """
 
@@ -46,26 +47,44 @@ import os
 import logging
 import tempfile
 import threading
+import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from gtts import gTTS
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
+# Advanced audio processing imports
 try:
     from pydub import AudioSegment
-    AUDIO_PROCESSING_AVAILABLE = True
-except ImportError:
-    AUDIO_PROCESSING_AVAILABLE = False
-    print("Warning: pydub not available. Audio enhancement disabled.")
+    from pydub.effects import normalize
+    import librosa
+    import soundfile as sf
+    ADVANCED_PROCESSING = True
+    print("✅ Advanced audio processing enabled (pydub + librosa)")
+except ImportError as e:
+    ADVANCED_PROCESSING = False
+    print(f"⚠️  Advanced processing disabled. Missing: {e}")
+    print("Install with: pip install pydub librosa soundfile numpy")
+    # Basic fallback
+    try:
+        from pydub import AudioSegment
+        BASIC_PROCESSING = True
+    except ImportError:
+        BASIC_PROCESSING = False
 
-# Configuration
+# Configuration for male voice simulation
 LANG = 'km'  # Khmer language code
-CHUNK_SIZE = 3500  # Reduced chunk size for better processing
-PORT = int(os.getenv('PORT', 8080))  # Port for health check server
-SPEECH_SPEED = 0.85  # Slower speed for softer speech (0.5-2.0)
-VOLUME_ADJUSTMENT = -3  # Slightly reduce volume for softer sound (dB)
+CHUNK_SIZE = 3000  # Smaller chunks for better processing
+PORT = int(os.getenv('PORT', 8080))
 
-# Global counter for audio file IDs
+# Voice masculinization parameters
+PITCH_SHIFT_SEMITONES = -4  # Lower pitch by 4 semitones (more masculine)
+FORMANT_SHIFT = 0.85        # Reduce formant frequencies (male characteristic)
+SPEED_FACTOR = 0.90         # Slightly slower for masculine delivery
+BASS_BOOST_DB = 3           # Boost low frequencies
+TREBLE_CUT_DB = -2          # Reduce high frequencies
+
+# Global counter
 audio_counter = 0
 
 # Logging
@@ -78,24 +97,24 @@ if not TOKEN:
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Simple health check handler for deployment platforms"""
+    """Health check handler"""
     def do_GET(self):
         if self.path == '/health' or self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b'OK - Khmer TTS Bot Running')
+            status = "Advanced" if ADVANCED_PROCESSING else "Basic" if BASIC_PROCESSING else "Limited"
+            self.wfile.write(f'OK - Khmer Male Voice TTS Bot ({status} Processing)'.encode())
         else:
             self.send_response(404)
             self.end_headers()
     
     def log_message(self, format, *args):
-        # Suppress default HTTP logging
         pass
 
 
 def start_health_check_server():
-    """Start a simple HTTP server for health checks"""
+    """Start health check server"""
     try:
         server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
         logger.info(f'Health check server started on port {PORT}')
@@ -105,130 +124,181 @@ def start_health_check_server():
 
 
 def split_text(text: str, chunk_size: int = CHUNK_SIZE):
-    """Split text into chunks of roughly chunk_size, trying to split on sentence boundaries.
-    Returns a list of text chunks.
-    """
+    """Split text intelligently on Khmer sentence boundaries"""
     text = text.strip()
     if len(text) <= chunk_size:
         return [text]
 
     chunks = []
     start = 0
+    
+    # Khmer and common sentence endings
+    endings = ['.', '។', '\n', '?', '!', '៕', '៖', 'ៗ', ':', ';']
+    
     while start < len(text):
         end = min(start + chunk_size, len(text))
-        # Try to find a sentence boundary backward from end
+        
         if end < len(text):
-            # Look for Khmer sentence endings and common punctuation
-            split_chars = ['.', '។', '\n', '?', '!', '៕', '៖', '។']
-            split_at = -1
+            # Find the best split point
+            best_split = end
+            for ending in endings:
+                split_pos = text.rfind(ending, start, end)
+                if split_pos > start:
+                    best_split = split_pos + 1
+                    break
             
-            for char in split_chars:
-                pos = text.rfind(char, start, end)
-                if pos > split_at and pos > start:
-                    split_at = pos
-            
-            if split_at == -1 or split_at <= start:
-                split_at = end
+            # If no good split found, try word boundary
+            if best_split == end:
+                space_pos = text.rfind(' ', start, end)
+                if space_pos > start:
+                    best_split = space_pos
         else:
-            split_at = end
+            best_split = end
 
-        chunk = text[start:split_at].strip()
+        chunk = text[start:best_split].strip()
         if chunk:
             chunks.append(chunk)
-        start = split_at
+        
+        start = best_split
         if start == end:
-            # Avoid infinite loop
-            start += 1
+            start += 1  # Avoid infinite loop
+            
     return chunks
 
 
-def enhance_audio(input_path: str, output_path: str):
-    """Enhance audio for softer, more natural male voice"""
-    if not AUDIO_PROCESSING_AVAILABLE:
-        # If pydub not available, just copy the file
-        import shutil
-        shutil.copy2(input_path, output_path)
-        return
+def masculinize_voice_advanced(audio_file_path: str, output_path: str):
+    """Advanced voice masculinization using librosa"""
+    if not ADVANCED_PROCESSING:
+        raise ImportError("Advanced processing not available")
     
     try:
-        audio = AudioSegment.from_mp3(input_path)
+        # Load audio file
+        y, sr = librosa.load(audio_file_path, sr=None)
         
-        # Adjust speed for softer speech
-        if SPEECH_SPEED != 1.0:
-            # Change speed without changing pitch (requires ffmpeg)
-            try:
-                audio = audio.speedup(playback_speed=1/SPEECH_SPEED)
-            except:
-                # Fallback: simple frame rate manipulation
-                audio = audio._spawn(audio.raw_data, overrides={
-                    "frame_rate": int(audio.frame_rate * SPEECH_SPEED)
-                }).set_frame_rate(audio.frame_rate)
+        # 1. Pitch shifting (lower pitch for male voice)
+        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=PITCH_SHIFT_SEMITONES)
         
-        # Adjust volume for softer sound
-        if VOLUME_ADJUSTMENT != 0:
-            audio = audio + VOLUME_ADJUSTMENT
+        # 2. Formant shifting (simulate male vocal tract)
+        # This is approximated by spectral envelope manipulation
+        stft = librosa.stft(y_shifted)
+        magnitude, phase = np.abs(stft), np.angle(stft)
         
-        # Apply gentle low-pass filter for warmer tone (male voice characteristic)
-        try:
-            audio = audio.low_pass_filter(3000)
-        except:
-            pass  # Skip if not supported
+        # Frequency axis manipulation for formant shifting
+        freqs = librosa.fft_frequencies(sr=sr)
+        formant_shifted_mag = np.zeros_like(magnitude)
         
-        # Add slight reverb effect for more natural sound
-        try:
-            # Simple reverb by mixing with delayed, quieter version
-            reverb = audio - 20  # 20dB quieter
-            delayed = AudioSegment.silent(duration=50) + reverb  # 50ms delay
-            audio = audio.overlay(delayed[:len(audio)])
-        except:
-            pass  # Skip if not supported
+        for i in range(magnitude.shape[1]):
+            # Interpolate to shift formant frequencies
+            freq_indices = np.arange(len(freqs)) * FORMANT_SHIFT
+            freq_indices = np.clip(freq_indices, 0, len(freqs) - 1)
+            
+            # Linear interpolation for formant shifting
+            for j, freq_idx in enumerate(freq_indices):
+                if j < len(magnitude):
+                    formant_shifted_mag[j, i] = np.interp(freq_idx, np.arange(len(freqs)), magnitude[:, i])
         
-        # Export enhanced audio
-        audio.export(output_path, format="mp3", bitrate="128k")
+        # Reconstruct audio
+        stft_modified = formant_shifted_mag * np.exp(1j * phase)
+        y_formant = librosa.istft(stft_modified)
+        
+        # 3. Speed adjustment (slightly slower for masculine delivery)
+        y_final = librosa.effects.time_stretch(y_formant, rate=1/SPEED_FACTOR)
+        
+        # 4. EQ adjustments (boost bass, reduce treble)
+        # Apply simple filtering
+        y_final = librosa.effects.preemphasis(y_final, coef=-0.1)  # Inverse preemphasis for bass boost
+        
+        # Save the processed audio
+        sf.write(output_path, y_final, sr)
+        
+        logger.info("✅ Advanced voice masculinization completed")
+        return True
         
     except Exception as e:
-        logger.warning(f'Audio enhancement failed, using original: {e}')
-        import shutil
-        shutil.copy2(input_path, output_path)
+        logger.error(f"Advanced processing failed: {e}")
+        return False
 
 
-def text_to_mp3(text: str, lang: str = LANG) -> str:
-    """Create an enhanced mp3 file from text using gTTS. Returns the file path.
+def masculinize_voice_basic(audio_file_path: str, output_path: str):
+    """Basic voice masculinization using pydub"""
+    try:
+        audio = AudioSegment.from_file(audio_file_path)
+        
+        # 1. Lower the pitch (octave down is too much, so we use frame rate trick)
+        # Reduce sample rate then restore (pitch shift effect)
+        new_sample_rate = int(audio.frame_rate * 0.85)  # Lower pitch
+        pitched_audio = audio._spawn(audio.raw_data, overrides={"frame_rate": new_sample_rate})
+        pitched_audio = pitched_audio.set_frame_rate(audio.frame_rate)
+        
+        # 2. Speed adjustment
+        if SPEED_FACTOR != 1.0:
+            # Simple speed change by frame rate manipulation
+            speed_audio = pitched_audio._spawn(
+                pitched_audio.raw_data, 
+                overrides={"frame_rate": int(pitched_audio.frame_rate * SPEED_FACTOR)}
+            ).set_frame_rate(pitched_audio.frame_rate)
+        else:
+            speed_audio = pitched_audio
+        
+        # 3. EQ adjustments
+        # Boost bass (low frequencies)
+        bass_boosted = speed_audio.low_pass_filter(1000).apply_gain(BASS_BOOST_DB)
+        mid_high = speed_audio.high_pass_filter(1000).apply_gain(TREBLE_CUT_DB)
+        
+        # Mix back together
+        final_audio = bass_boosted.overlay(mid_high)
+        
+        # 4. Normalize and export
+        final_audio = normalize(final_audio)
+        final_audio.export(output_path, format="mp3", bitrate="128k")
+        
+        logger.info("✅ Basic voice masculinization completed")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Basic processing failed: {e}")
+        return False
 
-    NOTE: Caller is responsible for deleting the file when finished.
-    """
+
+def create_male_voice_tts(text: str, lang: str = LANG) -> str:
+    """Create male-sounding TTS from text"""
     # Create temporary files
-    fd_raw, raw_path = tempfile.mkstemp(suffix='_raw.mp3')
-    os.close(fd_raw)
-    fd_enhanced, enhanced_path = tempfile.mkstemp(suffix='.mp3')
-    os.close(fd_enhanced)
+    fd_original, original_path = tempfile.mkstemp(suffix='_original.mp3')
+    os.close(fd_original)
+    fd_processed, processed_path = tempfile.mkstemp(suffix='_male.mp3')
+    os.close(fd_processed)
 
     try:
-        # Generate TTS with slower speaking rate if supported
-        tts_kwargs = {'text': text, 'lang': lang, 'slow': False}
+        # Generate original TTS (female voice)
+        tts = gTTS(text=text, lang=lang, slow=False)
+        tts.save(original_path)
         
-        # Try to use slower speech for softer sound
+        # Apply voice masculinization
+        success = False
+        
+        if ADVANCED_PROCESSING:
+            success = masculinize_voice_advanced(original_path, processed_path)
+        
+        if not success and BASIC_PROCESSING:
+            success = masculinize_voice_basic(original_path, processed_path)
+        
+        if not success:
+            # Fallback: just copy original
+            import shutil
+            shutil.copy2(original_path, processed_path)
+            logger.warning("Voice processing failed, using original female voice")
+        
+        # Clean up original
         try:
-            tts = gTTS(**tts_kwargs, slow=True)
-        except:
-            tts = gTTS(**tts_kwargs)
-        
-        tts.save(raw_path)
-        
-        # Enhance audio for male voice characteristics
-        enhance_audio(raw_path, enhanced_path)
-        
-        # Clean up raw file
-        try:
-            os.remove(raw_path)
+            os.remove(original_path)
         except:
             pass
             
-        return enhanced_path
+        return processed_path
         
     except Exception as e:
         # Clean up on error
-        for path in [raw_path, enhanced_path]:
+        for path in [original_path, processed_path]:
             try:
                 os.remove(path)
             except:
@@ -241,13 +311,16 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     
     chat_id = update.effective_chat.id
     user = update.effective_user
-    logger.info('TTS request from user=%s chat_id=%s len=%d', user and user.username, chat_id, len(text))
+    logger.info('🎙️ Male voice TTS request from user=%s chat_id=%s len=%d', 
+                user and user.username, chat_id, len(text))
 
-    # Send processing message with better feedback
+    # Processing message
+    processing_type = "Advanced" if ADVANCED_PROCESSING else "Basic" if BASIC_PROCESSING else "Standard"
     try:
         processing_msg = context.bot.send_message(
             chat_id=chat_id, 
-            text="🎙️ Creating natural male voice audio... Please wait."
+            text=f"🎙️ Creating male voice ({processing_type} processing)...\n"
+                 f"This may take a moment for best quality."
         )
     except Exception as e:
         logger.error(f'Failed to send processing message: {e}')
@@ -257,102 +330,128 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     files_to_delete = []
     
     try:
-        if len(chunks) == 1:
+        total_chunks = len(chunks)
+        
+        for i, chunk in enumerate(chunks, start=1):
             audio_counter += 1
-            audio_id = f"Voice{audio_counter:03d}"
-            mp3_path = text_to_mp3(chunks[0])
+            audio_id = f"MaleVoice{audio_counter:03d}"
+            
+            # Create male voice audio
+            mp3_path = create_male_voice_tts(chunk)
             files_to_delete.append(mp3_path)
             
             with open(mp3_path, 'rb') as f:
+                if total_chunks == 1:
+                    caption = f'🎧 {audio_id} - Khmer Male Voice ({processing_type})'
+                else:
+                    caption = f'🎧 {audio_id} - Part {i}/{total_chunks} ({processing_type})'
+                
                 context.bot.send_audio(
                     chat_id=chat_id, 
                     audio=f, 
                     filename=f'{audio_id}.mp3', 
-                    caption=f'🎧 {audio_id} - Khmer Male Voice',
-                    title=f'Khmer TTS - {audio_id}'
+                    caption=caption,
+                    title=f'Khmer Male TTS - {audio_id}',
+                    performer='Khmer TTS Bot'
                 )
-        else:
-            # Multiple chunks: send as a sequence
-            for i, chunk in enumerate(chunks, start=1):
-                audio_counter += 1
-                audio_id = f"Voice{audio_counter:03d}"
-                mp3_path = text_to_mp3(chunk)
-                files_to_delete.append(mp3_path)
-                
-                with open(mp3_path, 'rb') as f:
-                    caption = f'🎧 {audio_id} - Part {i}/{len(chunks)} (Male Voice)'
-                    context.bot.send_audio(
-                        chat_id=chat_id, 
-                        audio=f, 
-                        filename=f'{audio_id}.mp3', 
-                        caption=caption,
-                        title=f'Khmer TTS - {audio_id}'
-                    )
                     
     except Exception as e:
-        logger.exception('Error creating or sending TTS audio: %s', e)
+        logger.exception('Error creating male voice TTS: %s', e)
         try:
-            update.message.reply_text(
-                'Sorry, an error occurred while creating the speech. Please try again.\n'
-                'សោមទោស! មានបញ្ហាក្នុងការបង្កើតសំឡេង។ សូមព្យាយាមម្តងទៀត។'
+            error_msg = (
+                'Sorry, an error occurred while creating the male voice. '
+                'សោមទោស! មានបញ្ហាក្នុងការបង្កើតសំឡេងប្រុស។'
             )
+            if not ADVANCED_PROCESSING:
+                error_msg += '\n\n💡 Install librosa for better voice processing:\npip install librosa soundfile'
+                
+            update.message.reply_text(error_msg)
         except Exception:
             pass
     finally:
-        # Clean up temp files
-        for p in files_to_delete:
+        # Clean up
+        for path in files_to_delete:
             try:
-                os.remove(p)
-            except Exception:
+                os.remove(path)
+            except:
                 pass
         
         # Delete processing message
         if processing_msg:
             try:
                 context.bot.delete_message(chat_id=chat_id, message_id=processing_msg.message_id)
-            except Exception:
+            except:
                 pass
 
 
 def start_handler(update: Update, context: CallbackContext):
     """Handle /start command"""
+    processing_type = "Advanced" if ADVANCED_PROCESSING else "Basic" if BASIC_PROCESSING else "Standard"
+    
     welcome_msg = (
-        "សួស្តី! 🇰🇭🎙️\n\n"
-        "I'm an enhanced Khmer Text-to-Speech bot with natural male voice!\n"
-        "ខ្ញុំជាបុគ្គលិកសំឡេងខ្មែរប្រុស ធម្មជាតិ!\n\n"
-        "✨ Features:\n"
-        "• Natural male voice with soft tone\n"
-        "• Enhanced audio quality\n"
-        "• Supports both Khmer and English\n"
-        "• Automatic text chunking for long messages\n\n"
-        "Commands:\n"
-        "• Send any text → Get enhanced audio\n"
+        "សួស្តី! 🇰🇭👨‍💼\n\n"
+        "I'm a Khmer Male Voice TTS bot! I convert the default female Khmer voice "
+        "to sound more masculine through advanced audio processing.\n\n"
+        f"🔧 Processing Mode: **{processing_type}**\n\n"
+        "✨ Male Voice Features:\n"
+        "• Pitch shifted down for masculine tone\n"
+        "• Formant frequencies adjusted\n" + 
+        ("• Advanced spectral processing\n" if ADVANCED_PROCESSING else "") +
+        "• Bass boost & treble adjustment\n"
+        "• Natural speed optimization\n\n"
+        "📝 Usage:\n"
+        "• Send any Khmer text → Get male voice audio\n"
         "• /speak <text> - Convert specific text\n"
-        "• /help - Show detailed help"
+        "• /help - Detailed help & tips"
     )
-    update.message.reply_text(welcome_msg)
+    
+    if not ADVANCED_PROCESSING:
+        welcome_msg += (
+            "\n\n💡 **Pro Tip**: For best male voice quality, install:\n"
+            "`pip install librosa soundfile numpy`"
+        )
+    
+    update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
 
 def help_handler(update: Update, context: CallbackContext):
     """Handle /help command"""
+    processing_type = "Advanced" if ADVANCED_PROCESSING else "Basic" if BASIC_PROCESSING else "Standard"
+    
     help_msg = (
-        "🎧 Enhanced Khmer TTS Bot Help\n\n"
-        "🎙️ Voice Features:\n"
-        "• Natural male voice tone\n"
-        "• Slower, softer speech\n"
-        "• Enhanced audio processing\n"
-        "• Warm, pleasant sound\n\n"
-        "📝 How to use:\n"
-        "• Send any Khmer text → Get audio back\n"
-        "• /speak <your text> → Convert specific text\n"
-        "• Works with mixed Khmer/English text\n"
-        "• Long texts split automatically\n\n"
-        "💡 Examples:\n"
-        "• /speak សួស្ដីអ្នកសុខសប្បាយទេ\n"
-        "• /speak Hello សួស្ដី mixed text\n"
-        "• Just type: ថ្ងៃនេះអាកាសធាតុល្អ"
+        f"🎧 Khmer Male Voice TTS Bot - {processing_type} Mode\n\n"
+        "🎙️ **How it works:**\n"
+        "1. Generate Khmer TTS (female base voice)\n"
+        "2. Apply pitch shifting (lower frequency)\n"
+        "3. Adjust formant frequencies (male characteristics)\n"
+        "4. Enhance bass and reduce treble\n"
+        "5. Optimize speed for masculine delivery\n\n"
+        "📝 **Commands:**\n"
+        "• Send text directly → Auto conversion\n"
+        "• `/speak <text>` → Convert specific text\n"
+        "• `/help` → This help message\n\n"
+        "💡 **Examples:**\n"
+        "• `សួស្ដីអ្នកសុខសប្បាយទេ`\n"
+        "• `/speak ថ្ងៃនេះអាកាសធាតុល្អណាស់`\n"
+        "• `Hello mixed ជាមួយ Khmer text`\n\n"
     )
-    update.message.reply_text(help_msg)
+    
+    if not ADVANCED_PROCESSING:
+        help_msg += (
+            "🔧 **Upgrade Processing:**\n"
+            "For best male voice quality:\n"
+            "```\n"
+            "pip install librosa soundfile numpy\n"
+            "```\n"
+            "Then restart the bot for advanced spectral processing!"
+        )
+    else:
+        help_msg += (
+            "✅ **Advanced Processing Active**\n"
+            "You're getting the highest quality male voice simulation!"
+        )
+    
+    update.message.reply_text(help_msg, parse_mode='Markdown')
 
 
 def speak_handler(update: Update, context: CallbackContext):
@@ -360,9 +459,10 @@ def speak_handler(update: Update, context: CallbackContext):
     text = ' '.join(context.args)
     if not text:
         update.message.reply_text(
-            'Please provide text after /speak\n\n'
-            'Example: /speak សួស្ដី\n'
-            'ឧទាហរណ៍: /speak សួស្ដីអ្នកសុខសប្បាយទេ'
+            '🎙️ Please provide text after /speak\n\n'
+            '**Example:** `/speak សួស្ដីអ្នកសុខសប្បាយទេ`\n'
+            '**ឧទាហរណ៍:** `/speak ថ្ងៃនេះអាកាសធាតុល្អ`',
+            parse_mode='Markdown'
         )
         return
     tts_and_send(update, context, text)
@@ -383,9 +483,9 @@ def error_handler(update: Update, context: CallbackContext):
         if update and update.effective_chat:
             context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text="An error occurred. Please try again.\nមានបញ្ហា! សូមព្យាយាមម្តងទៀត។"
+                text="❌ An error occurred. Please try again.\nមានបញ្ហា! សូមព្យាយាមម្តងទៀត។"
             )
-    except Exception:
+    except:
         pass
 
 
@@ -393,19 +493,24 @@ def main():
     if not TOKEN:
         raise RuntimeError('TELEGRAM_TOKEN environment variable not set')
 
-    # Log configuration
-    logger.info('=== Enhanced Khmer TTS Bot Configuration ===')
+    # Configuration summary
+    logger.info('=' * 50)
+    logger.info('🎙️ KHMER MALE VOICE TTS BOT')
+    logger.info('=' * 50)
     logger.info(f'Language: {LANG}')
-    logger.info(f'Speech Speed: {SPEECH_SPEED}x')
-    logger.info(f'Volume Adjustment: {VOLUME_ADJUSTMENT} dB')
-    logger.info(f'Audio Enhancement: {"Enabled" if AUDIO_PROCESSING_AVAILABLE else "Disabled"}')
-    logger.info(f'Chunk Size: {CHUNK_SIZE} characters')
+    logger.info(f'Processing: {"Advanced (librosa)" if ADVANCED_PROCESSING else "Basic (pydub)" if BASIC_PROCESSING else "Limited"}')
+    logger.info(f'Pitch Shift: {PITCH_SHIFT_SEMITONES} semitones')
+    logger.info(f'Formant Shift: {FORMANT_SHIFT}x')
+    logger.info(f'Speed Factor: {SPEED_FACTOR}x')
+    logger.info(f'Bass Boost: +{BASS_BOOST_DB}dB')
+    logger.info(f'Treble Cut: {TREBLE_CUT_DB}dB')
+    logger.info('=' * 50)
 
-    # Start health check server in a separate thread
+    # Start health check server
     health_thread = threading.Thread(target=start_health_check_server, daemon=True)
     health_thread.start()
 
-    # Set up the bot
+    # Set up bot
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
@@ -416,12 +521,12 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_message_handler))
     dp.add_error_handler(error_handler)
 
-    logger.info('🎙️ Starting Enhanced Khmer TTS Telegram bot with male voice...')
-    logger.info(f'📡 Health check available at http://localhost:{PORT}/health')
+    logger.info('🚀 Starting Khmer Male Voice TTS Bot...')
+    logger.info(f'📡 Health check: http://localhost:{PORT}/health')
     
     # Start the bot
     updater.start_polling(drop_pending_updates=True)
-    logger.info('✅ Bot is running! Send /start to begin.')
+    logger.info('✅ Bot is running! Send /start to test the male voice.')
     updater.idle()
 
 
