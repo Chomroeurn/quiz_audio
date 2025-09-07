@@ -11,14 +11,13 @@ Features:
 - `/speak <text>` command explicitly creates audio from provided text.
 - Any plain text message (non-command) will also be converted to speech.
 - Splits long text into chunks to avoid remote TTS length limits.
+- Includes health check endpoint for deployment platforms.
 
 Requirements
 ------------
 Install required packages:
 
     pip install python-telegram-bot==13.17 gTTS
-
-(Optionally install ffmpeg/pydub if you want to convert mp3->ogg/opus for voice notes.)
 
 Environment
 -----------
@@ -43,7 +42,8 @@ Notes
 import os
 import logging
 import tempfile
-import math
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from gtts import gTTS
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
@@ -51,6 +51,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 # Configuration
 LANG = 'km'  # Khmer language code
 CHUNK_SIZE = 4000  # chunk length for splitting very long texts (characters)
+PORT = int(os.getenv('PORT', 8080))  # Port for health check server
 
 # Global counter for audio file IDs
 audio_counter = 0
@@ -62,6 +63,33 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 if not TOKEN:
     logger.error('Please set the TELEGRAM_TOKEN environment variable and restart the bot.')
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple health check handler for deployment platforms"""
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress default HTTP logging
+        pass
+
+
+def start_health_check_server():
+    """Start a simple HTTP server for health checks"""
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+        logger.info(f'Health check server started on port {PORT}')
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f'Failed to start health check server: {e}')
 
 
 def split_text(text: str, chunk_size: int = CHUNK_SIZE):
@@ -108,9 +136,17 @@ def text_to_mp3(text: str, lang: str = LANG) -> str:
     fd, path = tempfile.mkstemp(suffix='.mp3')
     os.close(fd)
 
-    tts = gTTS(text=text, lang=lang)
-    tts.save(path)
-    return path
+    try:
+        tts = gTTS(text=text, lang=lang)
+        tts.save(path)
+        return path
+    except Exception as e:
+        # Clean up on error
+        try:
+            os.remove(path)
+        except:
+            pass
+        raise e
 
 
 def tts_and_send(update: Update, context: CallbackContext, text: str):
@@ -121,19 +157,30 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     logger.info('TTS request from user=%s chat_id=%s len=%d', user and user.username, chat_id, len(text))
 
     # Send processing message
-    processing_msg = context.bot.send_message(chat_id=chat_id, text="🎵 Processing your text... Please wait.")
+    try:
+        processing_msg = context.bot.send_message(chat_id=chat_id, text="🎵 Processing your text... Please wait.")
+    except Exception as e:
+        logger.error(f'Failed to send processing message: {e}')
+        processing_msg = None
 
     chunks = split_text(text)
     files_to_delete = []
+    
     try:
         if len(chunks) == 1:
             audio_counter += 1
             audio_id = f"Gyn{audio_counter:02d}"
             mp3_path = text_to_mp3(chunks[0])
             files_to_delete.append(mp3_path)
+            
             with open(mp3_path, 'rb') as f:
                 # send as audio (mp3) so user can play it; Telegram will accept mp3 via send_audio
-                context.bot.send_audio(chat_id=chat_id, audio=f, filename=f'{audio_id}.mp3', caption=f'🎧 {audio_id} - Khmer TTS')
+                context.bot.send_audio(
+                    chat_id=chat_id, 
+                    audio=f, 
+                    filename=f'{audio_id}.mp3', 
+                    caption=f'🎧 {audio_id} - Khmer TTS'
+                )
         else:
             # Multiple chunks: send as a sequence of audios
             for i, chunk in enumerate(chunks, start=1):
@@ -141,12 +188,22 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
                 audio_id = f"Gyn{audio_counter:02d}"
                 mp3_path = text_to_mp3(chunk)
                 files_to_delete.append(mp3_path)
+                
                 with open(mp3_path, 'rb') as f:
-                    caption = f'{audio_id} - Part {i}/{len(chunks)}'
-                    context.bot.send_audio(chat_id=chat_id, audio=f, filename=f'{audio_id}.mp3', caption=caption)
+                    caption = f'🎧 {audio_id} - Part {i}/{len(chunks)}'
+                    context.bot.send_audio(
+                        chat_id=chat_id, 
+                        audio=f, 
+                        filename=f'{audio_id}.mp3', 
+                        caption=caption
+                    )
+                    
     except Exception as e:
         logger.exception('Error creating or sending TTS audio: %s', e)
-        update.message.reply_text('Sorry, an error occurred while creating the speech.')
+        try:
+            update.message.reply_text('Sorry, an error occurred while creating the speech. Please try again.')
+        except Exception:
+            pass
     finally:
         # Clean up temp files
         for p in files_to_delete:
@@ -156,57 +213,88 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
                 pass
         
         # Delete processing message
-        try:
-            context.bot.delete_message(chat_id=chat_id, message_id=processing_msg.message_id)
-        except Exception:
-            pass
+        if processing_msg:
+            try:
+                context.bot.delete_message(chat_id=chat_id, message_id=processing_msg.message_id)
+            except Exception:
+                pass
 
 
 def start_handler(update: Update, context: CallbackContext):
-    update.message.reply_text('សួស្តី! Send me Khmer text and I will reply with an audio file (Khmer TTS). Use /speak <text> to explicitly request speech.')
+    """Handle /start command"""
+    welcome_msg = (
+        "សួស្តី! 🇰🇭\n\n"
+        "I'm a Khmer Text-to-Speech bot. Send me any Khmer text and I'll convert it to audio!\n\n"
+        "Commands:\n"
+        "• Just send any text for TTS\n"
+        "• /speak <text> - Convert specific text to speech\n"
+        "• /help - Show this help message"
+    )
+    update.message.reply_text(welcome_msg)
 
 
 def help_handler(update: Update, context: CallbackContext):
-    update.message.reply_text('Send plain Khmer text to get an audio MP3 back. Or use /speak followed by the text.')
+    """Handle /help command"""
+    help_msg = (
+        "🎧 Khmer TTS Bot Help\n\n"
+        "How to use:\n"
+        "• Send any Khmer text message → Get audio back\n"
+        "• /speak <your text> → Convert specific text\n"
+        "• Works with both Khmer and English text\n"
+        "• Long texts are automatically split into parts\n\n"
+        "Example: /speak សួស្ដីអ្នកសុខសប្បាយទេ"
+    )
+    update.message.reply_text(help_msg)
 
 
 def speak_handler(update: Update, context: CallbackContext):
+    """Handle /speak command"""
     # /speak <text>
     text = ' '.join(context.args)
     if not text:
-        update.message.reply_text('Please put the text after /speak, e.g. /speak សួស្តី')
+        update.message.reply_text('Please provide text after /speak\n\nExample: /speak សួស្ដី')
         return
     tts_and_send(update, context, text)
 
 
 def text_message_handler(update: Update, context: CallbackContext):
+    """Handle plain text messages"""
     # For any plain text message, convert to speech
     text = update.message.text
-    if not text:
+    if not text or text.strip() == '':
         return
-    # Optionally: detect language or check if contains Khmer characters
     tts_and_send(update, context, text)
 
 
 def error_handler(update: Update, context: CallbackContext):
+    """Handle errors"""
     logger.error('Update caused error: %s', context.error)
 
 
 def main():
     if not TOKEN:
-        raise RuntimeError('TELEGRAM_TOKEN not set')
+        raise RuntimeError('TELEGRAM_TOKEN environment variable not set')
 
+    # Start health check server in a separate thread
+    health_thread = threading.Thread(target=start_health_check_server, daemon=True)
+    health_thread.start()
+
+    # Set up the bot
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Add handlers
     dp.add_handler(CommandHandler('start', start_handler))
     dp.add_handler(CommandHandler('help', help_handler))
-    dp.add_handler(CommandHandler('speak', speak_handler, pass_args=True))
+    dp.add_handler(CommandHandler('speak', speak_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_message_handler))
     dp.add_error_handler(error_handler)
 
-    logger.info('Starting Khmer TTS bot...')
-    updater.start_polling()
+    logger.info('Starting Khmer TTS Telegram bot...')
+    logger.info(f'Health check available at http://localhost:{PORT}/health')
+    
+    # Start the bot
+    updater.start_polling(drop_pending_updates=True)
     updater.idle()
 
 
