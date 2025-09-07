@@ -52,6 +52,9 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 LANG = 'km'  # Khmer language code
 CHUNK_SIZE = 4000  # chunk length for splitting very long texts (characters)
 
+# Global counter for audio file IDs
+audio_counter = 0
+
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -111,6 +114,8 @@ def text_to_mp3(text: str, lang: str = LANG) -> str:
 
 
 def tts_and_send(update: Update, context: CallbackContext, text: str):
+    global audio_counter
+    
     chat_id = update.effective_chat.id
     user = update.effective_user
     logger.info('TTS request from user=%s chat_id=%s len=%d', user and user.username, chat_id, len(text))
@@ -122,19 +127,23 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     files_to_delete = []
     try:
         if len(chunks) == 1:
+            audio_counter += 1
+            audio_id = f"Gyn{audio_counter:02d}"
             mp3_path = text_to_mp3(chunks[0])
             files_to_delete.append(mp3_path)
             with open(mp3_path, 'rb') as f:
                 # send as audio (mp3) so user can play it; Telegram will accept mp3 via send_audio
-                context.bot.send_audio(chat_id=chat_id, audio=f, filename='tts_khmer.mp3', caption='🎧 Khmer TTS')
+                context.bot.send_audio(chat_id=chat_id, audio=f, filename=f'{audio_id}.mp3', caption=f'🎧 {audio_id} - Khmer TTS')
         else:
             # Multiple chunks: send as a sequence of audios
             for i, chunk in enumerate(chunks, start=1):
+                audio_counter += 1
+                audio_id = f"Gyn{audio_counter:02d}"
                 mp3_path = text_to_mp3(chunk)
                 files_to_delete.append(mp3_path)
                 with open(mp3_path, 'rb') as f:
-                    caption = f'Part {i}/{len(chunks)}'
-                    context.bot.send_audio(chat_id=chat_id, audio=f, filename=f'tts_khmer_part{i}.mp3', caption=caption)
+                    caption = f'{audio_id} - Part {i}/{len(chunks)}'
+                    context.bot.send_audio(chat_id=chat_id, audio=f, filename=f'{audio_id}.mp3', caption=caption)
     except Exception as e:
         logger.exception('Error creating or sending TTS audio: %s', e)
         update.message.reply_text('Sorry, an error occurred while creating the speech.')
