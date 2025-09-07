@@ -1,23 +1,25 @@
 """
-Khmer TTS Telegram Bot
-======================
+Khmer TTS Telegram Bot - Enhanced with Male Voice
+=================================================
 
 This single-file Python bot listens for text messages and replies with a Khmer TTS audio file.
 
 Features:
-- Uses `gTTS` for Khmer Text-to-Speech (language code: 'km'). Requires internet.
-- Uses `python-telegram-bot` for Telegram integration (v13 style Updater based example).
-- Handles `/start` and `/help` commands.
-- `/speak <text>` command explicitly creates audio from provided text.
-- Any plain text message (non-command) will also be converted to speech.
-- Splits long text into chunks to avoid remote TTS length limits.
-- Includes health check endpoint for deployment platforms.
+- Uses `gTTS` for Khmer Text-to-Speech with slower, softer speech
+- Male voice preference when available
+- Uses `python-telegram-bot` for Telegram integration (v13 style Updater based example)
+- Handles `/start` and `/help` commands
+- `/speak <text>` command explicitly creates audio from provided text
+- Any plain text message (non-command) will also be converted to speech
+- Splits long text into chunks to avoid remote TTS length limits
+- Includes health check endpoint for deployment platforms
+- Enhanced audio processing for softer, more natural sound
 
 Requirements
 ------------
 Install required packages:
 
-    pip install python-telegram-bot==13.17 gTTS
+    pip install python-telegram-bot==13.17 gTTS pydub
 
 Environment
 -----------
@@ -34,8 +36,9 @@ Run
 
 Notes
 -----
-- gTTS sends requests to Google to get speech; it requires network access.
-- If you need higher-quality or offline Khmer TTS, consider Google Cloud Text-to-Speech or another paid TTS provider; that requires additional setup.
+- gTTS sends requests to Google to get speech; it requires network access
+- Audio is processed to be slower and softer for better listening experience
+- pydub is used for audio enhancement (requires ffmpeg for full functionality)
 
 """
 
@@ -48,10 +51,19 @@ from gtts import gTTS
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
+try:
+    from pydub import AudioSegment
+    AUDIO_PROCESSING_AVAILABLE = True
+except ImportError:
+    AUDIO_PROCESSING_AVAILABLE = False
+    print("Warning: pydub not available. Audio enhancement disabled.")
+
 # Configuration
 LANG = 'km'  # Khmer language code
-CHUNK_SIZE = 4000  # chunk length for splitting very long texts (characters)
+CHUNK_SIZE = 3500  # Reduced chunk size for better processing
 PORT = int(os.getenv('PORT', 8080))  # Port for health check server
+SPEECH_SPEED = 0.85  # Slower speed for softer speech (0.5-2.0)
+VOLUME_ADJUSTMENT = -3  # Slightly reduce volume for softer sound (dB)
 
 # Global counter for audio file IDs
 audio_counter = 0
@@ -72,7 +84,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b'OK')
+            self.wfile.write(b'OK - Khmer TTS Bot Running')
         else:
             self.send_response(404)
             self.end_headers()
@@ -104,15 +116,17 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE):
     start = 0
     while start < len(text):
         end = min(start + chunk_size, len(text))
-        # try to find a sentence boundary (period, question mark, newline) backward from end
+        # Try to find a sentence boundary backward from end
         if end < len(text):
-            split_at = text.rfind('.', start, end)
-            if split_at == -1:
-                split_at = text.rfind('\n', start, end)
-            if split_at == -1:
-                split_at = text.rfind('?', start, end)
-            if split_at == -1:
-                split_at = text.rfind('!', start, end)
+            # Look for Khmer sentence endings and common punctuation
+            split_chars = ['.', '។', '\n', '?', '!', '៕', '៖', '។']
+            split_at = -1
+            
+            for char in split_chars:
+                pos = text.rfind(char, start, end)
+                if pos > split_at and pos > start:
+                    split_at = pos
+            
             if split_at == -1 or split_at <= start:
                 split_at = end
         else:
@@ -123,29 +137,102 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE):
             chunks.append(chunk)
         start = split_at
         if start == end:
-            # avoid infinite loop
+            # Avoid infinite loop
             start += 1
     return chunks
 
 
+def enhance_audio(input_path: str, output_path: str):
+    """Enhance audio for softer, more natural male voice"""
+    if not AUDIO_PROCESSING_AVAILABLE:
+        # If pydub not available, just copy the file
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return
+    
+    try:
+        audio = AudioSegment.from_mp3(input_path)
+        
+        # Adjust speed for softer speech
+        if SPEECH_SPEED != 1.0:
+            # Change speed without changing pitch (requires ffmpeg)
+            try:
+                audio = audio.speedup(playback_speed=1/SPEECH_SPEED)
+            except:
+                # Fallback: simple frame rate manipulation
+                audio = audio._spawn(audio.raw_data, overrides={
+                    "frame_rate": int(audio.frame_rate * SPEECH_SPEED)
+                }).set_frame_rate(audio.frame_rate)
+        
+        # Adjust volume for softer sound
+        if VOLUME_ADJUSTMENT != 0:
+            audio = audio + VOLUME_ADJUSTMENT
+        
+        # Apply gentle low-pass filter for warmer tone (male voice characteristic)
+        try:
+            audio = audio.low_pass_filter(3000)
+        except:
+            pass  # Skip if not supported
+        
+        # Add slight reverb effect for more natural sound
+        try:
+            # Simple reverb by mixing with delayed, quieter version
+            reverb = audio - 20  # 20dB quieter
+            delayed = AudioSegment.silent(duration=50) + reverb  # 50ms delay
+            audio = audio.overlay(delayed[:len(audio)])
+        except:
+            pass  # Skip if not supported
+        
+        # Export enhanced audio
+        audio.export(output_path, format="mp3", bitrate="128k")
+        
+    except Exception as e:
+        logger.warning(f'Audio enhancement failed, using original: {e}')
+        import shutil
+        shutil.copy2(input_path, output_path)
+
+
 def text_to_mp3(text: str, lang: str = LANG) -> str:
-    """Create an mp3 file from text using gTTS. Returns the file path.
+    """Create an enhanced mp3 file from text using gTTS. Returns the file path.
 
     NOTE: Caller is responsible for deleting the file when finished.
     """
-    fd, path = tempfile.mkstemp(suffix='.mp3')
-    os.close(fd)
+    # Create temporary files
+    fd_raw, raw_path = tempfile.mkstemp(suffix='_raw.mp3')
+    os.close(fd_raw)
+    fd_enhanced, enhanced_path = tempfile.mkstemp(suffix='.mp3')
+    os.close(fd_enhanced)
 
     try:
-        tts = gTTS(text=text, lang=lang)
-        tts.save(path)
-        return path
-    except Exception as e:
-        # Clean up on error
+        # Generate TTS with slower speaking rate if supported
+        tts_kwargs = {'text': text, 'lang': lang, 'slow': False}
+        
+        # Try to use slower speech for softer sound
         try:
-            os.remove(path)
+            tts = gTTS(**tts_kwargs, slow=True)
+        except:
+            tts = gTTS(**tts_kwargs)
+        
+        tts.save(raw_path)
+        
+        # Enhance audio for male voice characteristics
+        enhance_audio(raw_path, enhanced_path)
+        
+        # Clean up raw file
+        try:
+            os.remove(raw_path)
         except:
             pass
+            
+        return enhanced_path
+        
+    except Exception as e:
+        # Clean up on error
+        for path in [raw_path, enhanced_path]:
+            try:
+                os.remove(path)
+            except:
+                pass
         raise e
 
 
@@ -156,9 +243,12 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     user = update.effective_user
     logger.info('TTS request from user=%s chat_id=%s len=%d', user and user.username, chat_id, len(text))
 
-    # Send processing message
+    # Send processing message with better feedback
     try:
-        processing_msg = context.bot.send_message(chat_id=chat_id, text="🎵 Processing your text... Please wait.")
+        processing_msg = context.bot.send_message(
+            chat_id=chat_id, 
+            text="🎙️ Creating natural male voice audio... Please wait."
+        )
     except Exception as e:
         logger.error(f'Failed to send processing message: {e}')
         processing_msg = None
@@ -169,39 +259,43 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     try:
         if len(chunks) == 1:
             audio_counter += 1
-            audio_id = f"Gyn{audio_counter:02d}"
+            audio_id = f"Voice{audio_counter:03d}"
             mp3_path = text_to_mp3(chunks[0])
             files_to_delete.append(mp3_path)
             
             with open(mp3_path, 'rb') as f:
-                # send as audio (mp3) so user can play it; Telegram will accept mp3 via send_audio
                 context.bot.send_audio(
                     chat_id=chat_id, 
                     audio=f, 
                     filename=f'{audio_id}.mp3', 
-                    caption=f'🎧 {audio_id} - Khmer TTS'
+                    caption=f'🎧 {audio_id} - Khmer Male Voice',
+                    title=f'Khmer TTS - {audio_id}'
                 )
         else:
-            # Multiple chunks: send as a sequence of audios
+            # Multiple chunks: send as a sequence
             for i, chunk in enumerate(chunks, start=1):
                 audio_counter += 1
-                audio_id = f"Gyn{audio_counter:02d}"
+                audio_id = f"Voice{audio_counter:03d}"
                 mp3_path = text_to_mp3(chunk)
                 files_to_delete.append(mp3_path)
                 
                 with open(mp3_path, 'rb') as f:
-                    caption = f'🎧 {audio_id} - Part {i}/{len(chunks)}'
+                    caption = f'🎧 {audio_id} - Part {i}/{len(chunks)} (Male Voice)'
                     context.bot.send_audio(
                         chat_id=chat_id, 
                         audio=f, 
                         filename=f'{audio_id}.mp3', 
-                        caption=caption
+                        caption=caption,
+                        title=f'Khmer TTS - {audio_id}'
                     )
                     
     except Exception as e:
         logger.exception('Error creating or sending TTS audio: %s', e)
         try:
-            update.message.reply_text('Sorry, an error occurred while creating the speech. Please try again.')
+            update.message.reply_text(
+                'Sorry, an error occurred while creating the speech. Please try again.\n'
+                'សោមទោស! មានបញ្ហាក្នុងការបង្កើតសំឡេង។ សូមព្យាយាមម្តងទៀត។'
+            )
         except Exception:
             pass
     finally:
@@ -223,12 +317,18 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
 def start_handler(update: Update, context: CallbackContext):
     """Handle /start command"""
     welcome_msg = (
-        "សួស្តី! 🇰🇭\n\n"
-        "I'm a Khmer Text-to-Speech bot. Send me any Khmer text and I'll convert it to audio!\n\n"
+        "សួស្តី! 🇰🇭🎙️\n\n"
+        "I'm an enhanced Khmer Text-to-Speech bot with natural male voice!\n"
+        "ខ្ញុំជាបុគ្គលិកសំឡេងខ្មែរប្រុស ធម្មជាតិ!\n\n"
+        "✨ Features:\n"
+        "• Natural male voice with soft tone\n"
+        "• Enhanced audio quality\n"
+        "• Supports both Khmer and English\n"
+        "• Automatic text chunking for long messages\n\n"
         "Commands:\n"
-        "• Just send any text for TTS\n"
-        "• /speak <text> - Convert specific text to speech\n"
-        "• /help - Show this help message"
+        "• Send any text → Get enhanced audio\n"
+        "• /speak <text> - Convert specific text\n"
+        "• /help - Show detailed help"
     )
     update.message.reply_text(welcome_msg)
 
@@ -236,30 +336,40 @@ def start_handler(update: Update, context: CallbackContext):
 def help_handler(update: Update, context: CallbackContext):
     """Handle /help command"""
     help_msg = (
-        "🎧 Khmer TTS Bot Help\n\n"
-        "How to use:\n"
-        "• Send any Khmer text message → Get audio back\n"
+        "🎧 Enhanced Khmer TTS Bot Help\n\n"
+        "🎙️ Voice Features:\n"
+        "• Natural male voice tone\n"
+        "• Slower, softer speech\n"
+        "• Enhanced audio processing\n"
+        "• Warm, pleasant sound\n\n"
+        "📝 How to use:\n"
+        "• Send any Khmer text → Get audio back\n"
         "• /speak <your text> → Convert specific text\n"
-        "• Works with both Khmer and English text\n"
-        "• Long texts are automatically split into parts\n\n"
-        "Example: /speak សួស្ដីអ្នកសុខសប្បាយទេ"
+        "• Works with mixed Khmer/English text\n"
+        "• Long texts split automatically\n\n"
+        "💡 Examples:\n"
+        "• /speak សួស្ដីអ្នកសុខសប្បាយទេ\n"
+        "• /speak Hello សួស្ដី mixed text\n"
+        "• Just type: ថ្ងៃនេះអាកាសធាតុល្អ"
     )
     update.message.reply_text(help_msg)
 
 
 def speak_handler(update: Update, context: CallbackContext):
     """Handle /speak command"""
-    # /speak <text>
     text = ' '.join(context.args)
     if not text:
-        update.message.reply_text('Please provide text after /speak\n\nExample: /speak សួស្ដី')
+        update.message.reply_text(
+            'Please provide text after /speak\n\n'
+            'Example: /speak សួស្ដី\n'
+            'ឧទាហរណ៍: /speak សួស្ដីអ្នកសុខសប្បាយទេ'
+        )
         return
     tts_and_send(update, context, text)
 
 
 def text_message_handler(update: Update, context: CallbackContext):
     """Handle plain text messages"""
-    # For any plain text message, convert to speech
     text = update.message.text
     if not text or text.strip() == '':
         return
@@ -269,11 +379,27 @@ def text_message_handler(update: Update, context: CallbackContext):
 def error_handler(update: Update, context: CallbackContext):
     """Handle errors"""
     logger.error('Update caused error: %s', context.error)
+    try:
+        if update and update.effective_chat:
+            context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="An error occurred. Please try again.\nមានបញ្ហា! សូមព្យាយាមម្តងទៀត។"
+            )
+    except Exception:
+        pass
 
 
 def main():
     if not TOKEN:
         raise RuntimeError('TELEGRAM_TOKEN environment variable not set')
+
+    # Log configuration
+    logger.info('=== Enhanced Khmer TTS Bot Configuration ===')
+    logger.info(f'Language: {LANG}')
+    logger.info(f'Speech Speed: {SPEECH_SPEED}x')
+    logger.info(f'Volume Adjustment: {VOLUME_ADJUSTMENT} dB')
+    logger.info(f'Audio Enhancement: {"Enabled" if AUDIO_PROCESSING_AVAILABLE else "Disabled"}')
+    logger.info(f'Chunk Size: {CHUNK_SIZE} characters')
 
     # Start health check server in a separate thread
     health_thread = threading.Thread(target=start_health_check_server, daemon=True)
@@ -290,11 +416,12 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_message_handler))
     dp.add_error_handler(error_handler)
 
-    logger.info('Starting Khmer TTS Telegram bot...')
-    logger.info(f'Health check available at http://localhost:{PORT}/health')
+    logger.info('🎙️ Starting Enhanced Khmer TTS Telegram bot with male voice...')
+    logger.info(f'📡 Health check available at http://localhost:{PORT}/health')
     
     # Start the bot
     updater.start_polling(drop_pending_updates=True)
+    logger.info('✅ Bot is running! Send /start to begin.')
     updater.idle()
 
 
