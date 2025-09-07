@@ -419,8 +419,9 @@ def help_handler(update: Update, context: CallbackContext):
         "• With numbers: Today is January 1st, 2024\n\n"
         "💡 Tips:\n"
         "• Use proper punctuation for natural pauses\n"
-        "• Mixed languages will use optimal single language\n"
-        "• Long texts are split but use consistent voice"
+        "• Long texts will be in single continuous audio\n"
+        "• Mixed languages use optimal single voice\n"
+        "• Character count shown in caption"
     )
     update.message.reply_text(help_msg)
 
