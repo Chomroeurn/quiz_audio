@@ -115,6 +115,9 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
     user = update.effective_user
     logger.info('TTS request from user=%s chat_id=%s len=%d', user and user.username, chat_id, len(text))
 
+    # Send processing message
+    processing_msg = context.bot.send_message(chat_id=chat_id, text="🎵 Processing your text... Please wait.")
+
     chunks = split_text(text)
     files_to_delete = []
     try:
@@ -136,11 +139,18 @@ def tts_and_send(update: Update, context: CallbackContext, text: str):
         logger.exception('Error creating or sending TTS audio: %s', e)
         update.message.reply_text('Sorry, an error occurred while creating the speech.')
     finally:
+        # Clean up temp files
         for p in files_to_delete:
             try:
                 os.remove(p)
             except Exception:
                 pass
+        
+        # Delete processing message
+        try:
+            context.bot.delete_message(chat_id=chat_id, message_id=processing_msg.message_id)
+        except Exception:
+            pass
 
 
 def start_handler(update: Update, context: CallbackContext):
