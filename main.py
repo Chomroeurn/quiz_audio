@@ -457,11 +457,11 @@ def error_handler(update: Update, context: CallbackContext):
 
 def main():
     logger.info("=" * 50)
-    logger.info("🎙️ KHMER MALE VOICE TTS BOT")
+    logger.info("🎙️ KHMER FEMALE VOICE TTS BOT")
     logger.info("=" * 50)
     logger.info(f"Dependencies - pydub: {HAS_PYDUB}, librosa: {HAS_LIBROSA}")
     logger.info(f"Processing mode: {'Advanced' if HAS_LIBROSA else 'Enhanced' if HAS_PYDUB else 'Basic'}")
-    logger.info(f"Pitch reduction: {PITCH_REDUCTION}")
+    logger.info(f"Pitch enhancement: {PITCH_ENHANCEMENT}")
     logger.info(f"Speed factor: {SPEED_FACTOR}")
     
     # Start health check
