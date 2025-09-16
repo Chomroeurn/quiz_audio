@@ -194,7 +194,7 @@ def send_tts(update, context, text):
                 continue
             
             audio_counter += 1
-            audio_id = f"Voice{audio_counter:03d}"
+            audio_id = f"Updated{audio_counter:03d}"
             
             try:
                 # Create audio
@@ -203,7 +203,7 @@ def send_tts(update, context, text):
                 
                 # Send audio
                 with open(audio_file, 'rb') as f:
-                    caption = f"🎧 {audio_id} - Khmer Female Voice"
+                    caption = f"🎧 {audio_id} - Khmer Female Update"
                     if len(chunks) > 1:
                         caption += f" (Part {i+1}/{len(chunks)})"
                     
