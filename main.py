@@ -203,7 +203,7 @@ def send_tts(update, context, text):
                 
                 # Send audio
                 with open(audio_file, 'rb') as f:
-                    caption = f"🎧 {audio_id} - Khmer Female Update"
+                    caption = f"🎧 {audio_id} - Khmer Female Update88"
                     if len(chunks) > 1:
                         caption += f" (Part {i+1}/{len(chunks)})"
                     
